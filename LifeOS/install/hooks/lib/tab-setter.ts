@@ -10,7 +10,7 @@
  * All hooks call setTabState() instead of directly running terminal commands.
  */
 
-import { existsSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, readFileSync } from 'fs';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, unlinkSync, readFileSync, renameSync, rmdirSync, statSync } from 'fs';
 import { join } from 'path';
 import { execSync, execFileSync } from 'child_process';
 import { TAB_COLORS, ACTIVE_TAB_BG, ACTIVE_TAB_FG, type TabState } from './tab-constants';
@@ -296,14 +296,11 @@ export function setTabState(opts: SetTabOptions): void {
     const winMatch = kWinId ? `--match=id:${kWinId}` : null;              // window commands
     const tabMatch = kWinId ? `--match=window_id:${kWinId}` : null;       // tab commands
     const kitten = kittenBin();
-    console.error(`[tab-setter] Setting tab: "${title}" via ${toArg} tab=${tabMatch ?? '(no match)'}`);
-    const titleArgs = tabMatch
-      ? ['@', toArg, 'set-tab-title', tabMatch, title]
-      : ['@', toArg, 'set-tab-title', title];
+    const paint = paintTabTitle(kitten, toArg, kWinId, title, state === 'idle');
+    console.error(`[tab-setter] Set tab: "${paint.painted}" via ${toArg} tab=${tabMatch ?? '(no match)'}`);
     const winTitleArgs = winMatch
-      ? ['@', toArg, 'set-window-title', winMatch, title]
-      : ['@', toArg, 'set-window-title', title];
-    execFileSync(kitten, titleArgs, { stdio: 'ignore', timeout: 2000 });
+      ? ['@', toArg, 'set-window-title', winMatch, paint.painted]
+      : ['@', toArg, 'set-window-title', paint.painted];
     execFileSync(kitten, winTitleArgs, { stdio: 'ignore', timeout: 2000 });
 
     // set-tab-color is a TAB command: match the tab holding our window, or fall
@@ -369,6 +366,192 @@ export function readTabState(sessionId?: string): { title: string; state: TabSta
       ascent: (raw.ascent || PHASE_TO_ASCENT[String(raw.phase || '').toLowerCase()]) as AscentState | undefined,
     };
   } catch { return null; }
+}
+
+// ── Manual-rename pin ──────────────────────────────────────────────────────
+// A tab the principal renamed by hand keeps that name; every stamp still
+// updates the leading state+activity glyphs. Detection: the live kitty tab
+// title no longer equals the title we last painted. A whitespace-only rename
+// hands the tab back to automatic naming (kitty's own empty rename resets the
+// title immediately, so a single space is the gesture). Pin state lives in its
+// own per-window file because the startup stamp deletes the tab-state file,
+// which would hide a rename made before the first prompt.
+
+const TAB_PINS_DIR = paiPath('MEMORY', 'STATE', 'tab-pins');
+
+export interface PinRecord {
+  /** The exact title this module last sent to kitty for the tab. */
+  lastPainted: string;
+  /** The principal's name for the tab, or null when LifeOS names it. */
+  pin: string | null;
+}
+
+/** Decide the pin from what we last painted and what kitty shows now. */
+export function resolvePin(record: PinRecord | null, live: string | null): string | null {
+  if (!record) return null;
+  if (live === null || live === record.lastPainted) return record.pin;
+  const name = stripPrefix(live).trim();
+  return name || null;
+}
+
+/** Keep the title's leading glyphs, swap its description for the pin. */
+export function applyPin(title: string, pin: string | null): string {
+  if (!pin) return title;
+  const trimmed = title.trimEnd();
+  const desc = stripPrefix(trimmed);
+  const prefix = trimmed.slice(0, trimmed.length - desc.length).trim();
+  return prefix ? `${prefix} ${pin}` : pin;
+}
+
+/**
+ * One paint: what to send to kitty and what to record afterwards. Idle paints
+ * (session start and end) always drop the pin — it lives for one session.
+ */
+export function planPaint(
+  record: PinRecord | null,
+  live: string | null,
+  composed: string,
+  idle: boolean,
+): { painted: string; record: PinRecord | null } {
+  if (idle) return { painted: composed, record: composed ? { lastPainted: composed, pin: null } : null };
+  const pin = resolvePin(record, live);
+  const painted = applyPin(composed, pin);
+  return { painted, record: { lastPainted: painted, pin } };
+}
+
+function readPinRecord(windowId: string): PinRecord | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(TAB_PINS_DIR, `${windowId}.json`), 'utf-8'));
+    if (typeof raw?.lastPainted !== 'string') return null;
+    return { lastPainted: raw.lastPainted, pin: typeof raw.pin === 'string' && raw.pin ? raw.pin : null };
+  } catch { return null; }
+}
+
+function writePinRecord(windowId: string, record: PinRecord | null): void {
+  try {
+    const path = join(TAB_PINS_DIR, `${windowId}.json`);
+    if (!record) { if (existsSync(path)) unlinkSync(path); return; }
+    // No mkdir here: every caller holds withTabLock, which creates TAB_PINS_DIR.
+    // Write-then-rename: a reader sees the old record or the new one, never a
+    // half-written file (a torn record reads as "none" and silently drops a pin).
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(record), 'utf-8');
+    renameSync(tmp, path);
+  } catch { /* silent — a lost record only means the next stamp can't see a rename */ }
+}
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * One stamp at a time per tab. Detection reads kitty's live title and then the
+ * last-painted record; a concurrent stamp painting in between made the reader
+ * compare an old title with a new record and pin an AUTOMATIC title as if the
+ * principal had typed it (live failure 2026-09-21: the async prompt hook's
+ * late stamp overlapped the turn-end stamp). The lock covers read → paint →
+ * record. Fail-open: a hook never waits more than ~3s, and a lock older than
+ * 5s is treated as abandoned by a dead process.
+ */
+function withTabLock<T>(windowId: string | null, fn: () => T): T {
+  if (!windowId) return fn();
+  const dir = join(TAB_PINS_DIR, `${windowId}.lock`);
+  const deadline = Date.now() + 3000;
+  let held = false;
+  try { mkdirSync(TAB_PINS_DIR, { recursive: true }); } catch { /* fall through */ }
+  while (!held) {
+    try { mkdirSync(dir); held = true; break; } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') break;
+      try { if (Date.now() - statSync(dir).mtimeMs > 5000) { rmdirSync(dir); continue; } } catch { continue; }
+      if (Date.now() > deadline) break;
+      sleepMs(25);
+    }
+  }
+  try { return fn(); } finally { if (held) { try { rmdirSync(dir); } catch { /* already gone */ } } }
+}
+
+/** The title kitty currently shows for the tab holding `windowId`, or null if unreadable. */
+function readLiveTabTitle(kitten: string, toArg: string, windowId: string): string | null {
+  try {
+    const raw = execFileSync(kitten, ['@', toArg, 'ls', `--match=id:${windowId}`], {
+      encoding: 'utf-8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const osWindows = JSON.parse(raw) as Array<{ tabs: Array<{ title?: unknown; windows: Array<{ id: number }> }> }>;
+    for (const os of osWindows) for (const tab of os.tabs) {
+      if (tab.windows.some(w => String(w.id) === windowId)) return typeof tab.title === 'string' ? tab.title : null;
+    }
+    return null;
+  } catch { return null; }
+}
+
+/**
+ * Glue for the two paint paths. No window id → no way to key a pin, so the
+ * composed title passes through. Idle paints skip the live read: they reset.
+ * The tab-state file keeps the COMPOSED title (so automatic naming resumes
+ * cleanly after an unpin); only kitty and the pin record see the pinned one.
+ */
+function planPinnedPaint(
+  kitten: string,
+  toArg: string,
+  windowId: string | null,
+  composed: string,
+  idle: boolean,
+): { painted: string; record: PinRecord | null } {
+  if (!windowId) return { painted: composed, record: null };
+  const live = idle ? null : readLiveTabTitle(kitten, toArg, windowId);
+  return planPaint(readPinRecord(windowId), live, composed, idle);
+}
+
+/**
+ * Paint one stamp under the tab lock: decide the title, set it, record it.
+ * Returns what was painted. Throws only if kitten refuses the title.
+ */
+function paintTabTitle(
+  kitten: string,
+  toArg: string,
+  windowId: string | null,
+  composed: string,
+  idle: boolean,
+): { painted: string } {
+  return withTabLock(windowId, () => {
+    const paint = planPinnedPaint(kitten, toArg, windowId, composed, idle);
+    const args = windowId
+      ? ['@', toArg, 'set-tab-title', `--match=window_id:${windowId}`, paint.painted]
+      : ['@', toArg, 'set-tab-title', paint.painted];
+    execFileSync(kitten, args, { stdio: 'ignore', timeout: 2000 });
+    if (windowId) writePinRecord(windowId, paint.record);
+    return { painted: paint.painted };
+  });
+}
+
+/**
+ * Name this session's tab on purpose (the /TabName path). Sets the pin
+ * directly under the lock rather than leaving a stamp to infer it, so a
+ * stamp already in flight cannot paint over it. Empty text hands the tab
+ * back: it repaints the last automatic title and clears the pin.
+ */
+export function nameTab(text: string, sessionId?: string): { ok: boolean; painted?: string; reason?: string } {
+  const env = getKittyEnv(sessionId);
+  if (!env.listenOn || !env.windowId) return { ok: false, reason: 'not in a kitty window with remote control' };
+  const windowId = env.windowId;
+  const toArg = `--to=${env.listenOn}`;
+  const kitten = kittenBin();
+  const pin = text.trim() || null;
+  try {
+    return withTabLock(windowId, () => {
+      const painted = pin
+        ? applyPin(readLiveTabTitle(kitten, toArg, windowId) ?? '', pin)
+        : (readTabState(sessionId)?.title || ' ');
+      execFileSync(kitten, ['@', toArg, 'set-tab-title', `--match=window_id:${windowId}`, painted], { stdio: 'ignore', timeout: 2000 });
+      writePinRecord(windowId, { lastPainted: painted, pin });
+      try {
+        execFileSync(kitten, ['@', toArg, 'set-window-title', `--match=id:${windowId}`, painted], { stdio: 'ignore', timeout: 2000 });
+      } catch { /* the tab title is what shows; the window title is a fallback */ }
+      return { ok: true, painted };
+    });
+  } catch (err) {
+    return { ok: false, reason: `kitten refused the rename: ${String((err as Error).message).split('\n')[0]}` };
+  }
 }
 
 /**
@@ -572,13 +755,10 @@ export function setAscentTab(state: AscentState, sessionId: string, summary?: st
     const colorTargetArg = tabMatch ?? '--self';
     const kitten = kittenBin();
 
-    const titleArgs = tabMatch
-      ? ['@', toArg, 'set-tab-title', tabMatch, title]
-      : ['@', toArg, 'set-tab-title', title];
+    const paint = paintTabTitle(kitten, toArg, kWinId, title, state === 'idle');
     const winTitleArgs = winMatch
-      ? ['@', toArg, 'set-window-title', winMatch, title]
-      : ['@', toArg, 'set-window-title', title];
-    execFileSync(kitten, titleArgs, { stdio: 'ignore', timeout: 2000 });
+      ? ['@', toArg, 'set-window-title', winMatch, paint.painted]
+      : ['@', toArg, 'set-window-title', paint.painted];
     execFileSync(kitten, winTitleArgs, { stdio: 'ignore', timeout: 2000 });
 
     const colorArgs = state === 'idle'
